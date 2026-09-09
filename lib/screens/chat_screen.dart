@@ -1,4 +1,6 @@
 import 'dart:io';
+import 'package:uuid/uuid.dart';
+import '../widgets/ai_onay_karti.dart';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
@@ -58,34 +60,42 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _mikrofonTetikle() async {
-    if (_recordingState) {
-      setState(() {
-        _recordingState = false;
-        _isProcessing = true;
-      });
-      final sesDosyasi = await SesService.instance.durdur();
+    if (_isProcessing) return;
+    if (!_recordingState) {
+      try {
+        final basladi = await SesService.instance.baslat();
+        if (mounted) setState(() => _recordingState = basladi);
+      } catch (_) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Mikrofon başlatılamadı. İzinleri kontrol edin.')),
+        );
+      }
+      return;
+    }
+    setState(() { _recordingState = false; _isProcessing = true; });
+    File? sesDosyasi;
+    try {
+      sesDosyasi = await SesService.instance.durdur();
       if (sesDosyasi != null) {
         final metin = await GeminiService.sesiYaziyaCevir(sesDosyasi);
-        if (await sesDosyasi.exists()) {
-          await sesDosyasi.delete();
-        }
-        if (metin.isNotEmpty) {
-          setState(() {
-            _controller.text = _controller.text.trim().isNotEmpty
-                ? "${_controller.text.trim()} $metin"
-                : metin;
-            _controller.selection = TextSelection.fromPosition(
-              TextPosition(offset: _controller.text.length),
-            );
-          });
-        }
+        if (!mounted) return;
+        setState(() {
+          _controller.text = '${_controller.text.trim()} $metin'.trim();
+          _controller.selection = TextSelection.fromPosition(
+            TextPosition(offset: _controller.text.length),
+          );
+        });
       }
-      setState(() => _isProcessing = false);
-    } else {
-      final basladi = await SesService.instance.baslat();
-      if (basladi) {
-        setState(() => _recordingState = true);
-      }
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error is FormatException
+            ? error.message : 'Ses kaydı işlenemedi. Yeniden deneyin.')),
+      );
+    } finally {
+      try {
+        if (sesDosyasi != null && await sesDosyasi.exists()) await sesDosyasi.delete();
+      } catch (_) { /* Temporary-file cleanup must not block the UI. */ }
+      if (mounted) setState(() => _isProcessing = false);
     }
   }
 
@@ -140,6 +150,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _gonder() async {
+    if (_isProcessing) return;
+    try {
+      await _gonderIslemi();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Analiz tamamlanamadı: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  Future<void> _gonderIslemi() async {
     final prompt = _controller.text.trim();
     if (prompt.isEmpty && _selectedFiles.isEmpty) {
       return;
@@ -173,7 +198,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (item['is_action'] != true) {
         return false;
       }
-      if (item['islem_kategorisi'] == 'STOK_DEPO_ISLEMI') {
+      if (item['preview_only'] == true || item['islem_kategorisi'] == 'STOK_DEPO_ISLEMI') {
         return true;
       }
       return item['cari_unvan'] != null &&
@@ -183,6 +208,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
     for (var item in items) {
       if (item is Map<String, dynamic>) {
+        item['firma_id'] = firmaId;
+        item['request_id'] = const Uuid().v4();
+        item['attached_file_paths'] = filesToSend.map((f) => f.path).toList();
+        item['preview_only'] = true;
         if (gonderilenDosyaYolu != null) {
           item['attached_file_path'] = gonderilenDosyaYolu;
         }
@@ -191,6 +220,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             .toString()
             .toUpperCase();
         item['islem_kategorisi'] = kategori;
+        if (item['preview_only'] == true) continue;
 
         // 🚨 STOK ARAYÜZÜ BİLGİ DOLDURMASI
         if (kategori == 'STOK_DEPO_ISLEMI') {
@@ -314,6 +344,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       }
     }
 
+    if (!mounted) return;
     setState(() {
       _messages.add(
         ChatMessage(
@@ -328,10 +359,43 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   // 🚨 STOK ONAYLAMA METODU EKLENDİ
   Future<void> _stokOnaylaVeKaydet(Map<String, dynamic> item) async {
-    setState(() {
+    await _guvenliKaydet(item, () => _stokKaydet(item));
+  }
+
+  Future<void> _guvenliKaydet(
+    Map<String, dynamic> item, Future<void> Function() kaydet,
+  ) async {
+    if (item['preview_only'] == true) return;
+    if (item['is_saved'] == true || item['is_saving'] == true) return;
+    if (item['firma_id'] != ref.read(firmaProvider).aktifFirmaId) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Belgenin analiz edildiği firmaya geçip tekrar onaylayın.')),
+      );
+      return;
+    }
+    final no = item['fatura_no']?.toString().trim() ?? '';
+    final key = '${item['firma_id']}:$no';
+    if (no.isNotEmpty && _kaydedilenFaturaNolari.contains(key)) return;
+    setState(() => item['is_saving'] = true);
+    try {
+      await kaydet();
       item['is_saved'] = true;
-    });
-    final firmaId = ref.read(firmaProvider).aktifFirmaId;
+      if (no.isNotEmpty) _kaydedilenFaturaNolari.add(key);
+    } catch (e) {
+      item['is_saved'] = false;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Kayıt tamamlanamadı: $e')),
+        );
+      }
+    } finally {
+      item['is_saving'] = false;
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> _stokKaydet(Map<String, dynamic> item) async {
+    final firmaId = item['firma_id'] as int;
 
     final action = item['action_type'];
     final stokAdi = item['stok_adi']?.toString() ?? 'Yeni Ürün';
@@ -398,18 +462,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _onaylaVeKaydet(Map<String, dynamic> item) async {
-    final faturaNo = item['fatura_no']?.toString().trim() ?? '';
-    if (_kaydedilenFaturaNolari.contains(faturaNo) && faturaNo.isNotEmpty) {
-      return;
-    }
-    setState(() {
-      if (faturaNo.isNotEmpty) {
-        _kaydedilenFaturaNolari.add(faturaNo);
-      }
-      item['is_saved'] = true;
-    });
+    await _guvenliKaydet(item, () => _belgeKaydet(item));
+  }
 
-    final firmaId = ref.read(firmaProvider).aktifFirmaId;
+  Future<void> _belgeKaydet(Map<String, dynamic> item) async {
+    final faturaNo = item['fatura_no']?.toString().trim() ?? '';
+    final firmaId = item['firma_id'] as int;
     final kategori = (item['islem_kategorisi'] ?? '').toString().toUpperCase();
     String hedefCariUnvan = item['cari_unvan']?.toString() ?? 'Genel Cari';
 
@@ -591,6 +649,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       }
 
       await DatabaseService.instance.islemKaydet(
+        islemKategorisi: kategori,
         unvan: hedefCariUnvan,
         islemTuru: (kategori == 'PERSONEL')
             ? 'PERSONEL_AVANS'
@@ -612,7 +671,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         firmaId: firmaId,
       );
     }
-    ref.read(ledgerProvider.notifier).yenile();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -728,7 +786,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                           (item) =>
                                               item is Map<String, dynamic> &&
                                               item['is_action'] == true &&
-                                              ((item['cari_unvan'] != null &&
+                                              (item['preview_only'] == true || (item['cari_unvan'] != null &&
                                                       item['cari_unvan']
                                                           .toString()
                                                           .trim()
@@ -839,6 +897,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                           ),
                                         if (gecerliAksiyonlar.isNotEmpty)
                                           ...gecerliAksiyonlar.map((item) {
+                                            if (item['preview_only'] == true) {
+                                              return AiOnayKarti(key: ValueKey(item['request_id']), item: item as Map<String, dynamic>);
+                                            }
                                             final isDup =
                                                 item['is_duplicate'] == true;
                                             final kategori =

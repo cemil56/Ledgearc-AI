@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../providers/firma_provider.dart';
+import '../services/ai_kayit_service.dart';
+import '../providers/cari_provider.dart';
 import 'cariler_screen.dart';
 import 'chat_screen.dart';
 import 'depo_stok_screen.dart';
@@ -21,6 +23,7 @@ class MainShell extends ConsumerStatefulWidget {
 
 class _MainShellState extends ConsumerState<MainShell> {
   int _seciliSekme = 0;
+  final _pageRevision = List<int>.filled(8, 0);
 
   final List<Widget> _sayfalar = const [
     ChatScreen(),
@@ -472,7 +475,14 @@ class _MainShellState extends ConsumerState<MainShell> {
           ),
         ],
       ),
-      body: IndexedStack(index: _seciliSekme, children: _sayfalar),
+      body: ValueListenableBuilder<int>(
+        valueListenable: aiKayitRevision,
+        builder: (context, revision, _) => IndexedStack(
+          index: _seciliSekme,
+          children: List.generate(_sayfalar.length, (i) => i == 0 ? _sayfalar[i] :
+            KeyedSubtree(key: ValueKey('${firma.aktifFirmaId}:$revision:$i:${_pageRevision[i]}'), child: _sayfalar[i])),
+        ),
+      ),
     );
   }
 
@@ -495,7 +505,8 @@ class _MainShellState extends ConsumerState<MainShell> {
           padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
         ),
         onPressed: () {
-          setState(() => _seciliSekme = index);
+          if (index == 1) ref.read(carilerProvider.notifier).yenile();
+          setState(() { _seciliSekme = index; if (index != 0) _pageRevision[index]++; });
         },
         child: Text(
           label,

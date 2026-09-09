@@ -18,6 +18,7 @@ class _TakvimScreenState extends ConsumerState<TakvimScreen> {
   List<Map<String, dynamic>> _tumKayitlar = [];
   bool _isLoading = true;
   String _filtre = 'HEPSİ';
+  bool _updating = false;
 
   @override
   void initState() {
@@ -46,7 +47,19 @@ class _TakvimScreenState extends ConsumerState<TakvimScreen> {
     }
   }
 
-  Future<void> _durumGuncelleModalAc({
+  Future<void> _durumGuncelleModalAc({required Map<String, dynamic> item, required bool isTahsilat}) async {
+    if (_updating) return;
+    _updating = true;
+    try {
+      await _durumGuncelleModalIslemi(item: item, isTahsilat: isTahsilat);
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error is StateError ? error.message.toString() : 'Evrak işlemi tamamlanamadı.')),
+      );
+    } finally { _updating = false; }
+  }
+
+  Future<void> _durumGuncelleModalIslemi({
     required Map<String, dynamic> item,
     required bool isTahsilat,
   }) async {
@@ -401,6 +414,7 @@ class _TakvimScreenState extends ConsumerState<TakvimScreen> {
     );
 
     if (sonuc == true) {
+      if (!mounted || firmaId != ref.read(firmaProvider).aktifFirmaId) return;
       if (secilenIslemTuru == 'KARSILIKSIZ') {
         if (isTahsilat) {
           await DatabaseService.instance.cekSenetKarsiliksizYap(
@@ -839,3 +853,4 @@ class _TakvimScreenState extends ConsumerState<TakvimScreen> {
     );
   }
 }
+

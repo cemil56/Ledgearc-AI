@@ -7,6 +7,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 class DatabaseService {
   static final DatabaseService instance = DatabaseService._init();
   final Map<int, Database> _dbPool = {};
+  final Map<int, Future<Database>> _opening = {};
 
   DatabaseService._init();
 
@@ -269,7 +270,7 @@ class DatabaseService {
         }
       }
 
-      final bool isMusteriCeki = evrakTuru == 'MUSTERI_CEKI';
+      final bool isMusteriCeki = evrakTuru == 'MUSTERI_CEKI' || evrakTuru == 'MUSTERI_SENEDI';
       final hareketId = await txn.insert('cari_hareketler', {
         'cari_id': finalCariId,
         'tarih': simdi.substring(0, 10),
@@ -353,6 +354,15 @@ class DatabaseService {
       if (evraklar.isEmpty) {
         return;
       }
+      if (evraklar.first['durum'] != null && evraklar.first['durum'] != 'PORTFOYDE') {
+        throw StateError('Bu evrak daha önce kapatılmış veya işleme alınmış.');
+      }
+      final received = evraklar.first['evrak_turu'].toString().startsWith('MUSTERI');
+      if ((received && yeniDurum != 'TAHSIL_EDILDI') || (!received && yeniDurum != 'ODENDI')) {
+        throw StateError('Evrak yönü ile kapanış işlemi uyuşmuyor.');
+      }
+      if (!const ['KASA', 'BANKA'].contains(odemeYeri)) throw StateError('Kasa/banka seçin.');
+
       final evrak = evraklar.first;
       final tutarKurus = (evrak['tutar'] as int?) ?? 0;
       final evrakTuru = evrak['evrak_turu']?.toString() ?? '';
@@ -400,7 +410,7 @@ class DatabaseService {
         }
         for (var m in yevmiye) {
           await txn.insert('yevmiye_kayitlari', {
-            'hareket_id': cekId,
+            'hareket_id': evraklar.first['hareket_id'],
             'fis_no': fisNo,
             'tarih': simdi.substring(0, 10),
             'hesap_kodu': m['kod'],
@@ -415,6 +425,14 @@ class DatabaseService {
   }
 
   Future<Database> getDatabase({int firmaId = 1}) async {
+    if (_dbPool.containsKey(firmaId)) return _dbPool[firmaId]!;
+    if (_opening.containsKey(firmaId)) return _opening[firmaId]!;
+    final opening = _openDatabase(firmaId);
+    _opening[firmaId] = opening;
+    try { return await opening; } finally { _opening.remove(firmaId); }
+  }
+
+  Future<Database> _openDatabase(int firmaId) async {
     if (_dbPool.containsKey(firmaId)) {
       return _dbPool[firmaId]!;
     }
@@ -428,10 +446,17 @@ class DatabaseService {
     final path = join(firmalarDir.path, 'firma_$firmaId.db');
     final db = await openDatabase(
       path,
-      version: 1,
-      onCreate: (db, version) => _createTables(db),
+      version: 3,
+      onCreate: (db, version) async {
+        await _createTables(db);
+        await _upgradeLinks(db);
+        await _createAiLinks(db);
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) await _upgradeLinks(db);
+        if (oldVersion < 3) await _createAiLinks(db);
+      },
     );
-    await _createTables(db);
     _dbPool[firmaId] = db;
     return db;
   }
@@ -471,11 +496,25 @@ class DatabaseService {
     await db.execute(
       '''CREATE TABLE IF NOT EXISTS stok_hareketleri (id INTEGER PRIMARY KEY AUTOINCREMENT, stok_id INTEGER NOT NULL, depo_id INTEGER NOT NULL, hedef_depo_id INTEGER, hareket_tipi TEXT NOT NULL, miktar REAL NOT NULL, birim_fiyat INTEGER NOT NULL, toplam_tutar INTEGER NOT NULL, tarih TEXT NOT NULL, belge_no TEXT, aciklama TEXT, FOREIGN KEY (stok_id) REFERENCES stok_kartlari (id) ON DELETE CASCADE, FOREIGN KEY (depo_id) REFERENCES depolar (id))''',
     );
-    await db.insert('depolar', {
-      'depo_adi': 'Merkez Depo',
-      'konum': 'Genel Merkez',
-      'varsayilan': 1,
-    });
+    final existing = await db.query('depolar', limit: 1);
+    if (existing.isEmpty) {
+      await db.insert('depolar', {
+        'depo_adi': 'Merkez Depo',
+        'konum': 'Genel Merkez',
+        'varsayilan': 1,
+      });
+    }
+  }
+
+  Future<void> _createAiLinks(Database db) async {
+    await db.execute('CREATE TABLE IF NOT EXISTS ai_odeme_eslestirme (odeme_id INTEGER PRIMARY KEY, fatura_id INTEGER NOT NULL, tutar INTEGER NOT NULL CHECK(tutar > 0))');
+  }
+
+  Future<void> _upgradeLinks(Database db) async {
+    await db.execute('ALTER TABLE stok_hareketleri ADD COLUMN hareket_id INTEGER');
+    // Legacy links cannot be reconstructed reliably from invoice numbers alone.
+    await db.execute('ALTER TABLE cari_hareketler ADD COLUMN guvenli_baglanti INTEGER NOT NULL DEFAULT 0');
+    await db.execute('CREATE INDEX IF NOT EXISTS stok_hareket_bag ON stok_hareketleri(hareket_id)');
   }
 
   Future<Map<String, dynamic>?> faturaVarMi(
@@ -520,6 +559,7 @@ class DatabaseService {
   }
 
   Future<int?> islemKaydet({
+    String? islemKategorisi,
     required String unvan,
     required String islemTuru,
     required double tutar,
@@ -538,44 +578,11 @@ class DatabaseService {
         .toIso8601String()
         .replaceAll('T', ' ')
         .substring(0, 19);
-    final islemKucuk = '$islemTuru $aciklama $unvan'.toLowerCase();
-    final isCariDisi = [
-      'virman',
-      'transfer',
-      'maaş',
-      'maas',
-      'personel',
-      'avans',
-      'usta',
-      'işçi',
-      'isci',
-      'çalışan',
-      'yakıt',
-      'yakit',
-      'benzin',
-      'mazot',
-      'akaryakıt',
-      'yemek',
-      'lokanta',
-      'restoran',
-      'market',
-      'noter',
-      'kargo',
-      'kırtasiye',
-      'kirtasiye',
-      'kira',
-      'aidat',
-      'elektrik',
-      'su',
-      'doğalgaz',
-      'dogalgaz',
-      'internet',
-      'gider',
-      'masraf',
-      'fiş',
-      'fis',
-    ].any((k) => islemKucuk.contains(k));
-
+    final kategori = islemKategorisi?.toUpperCase();
+    final isCariDisi = kategori != null
+        ? {'PERSONEL', 'ISLETME_GIDERI'}.contains(kategori)
+        : {'VIRMAN', 'TRANSFER', 'PERSONEL_AVANS', 'GİDER_FİŞİ'}
+            .contains(islemTuru.toUpperCase());
     return await db.transaction((txn) async {
       int? hareketId;
       final int tutarKurus = (tutar * 100).round();
@@ -625,6 +632,7 @@ class DatabaseService {
         }
 
         hareketId = await txn.insert('cari_hareketler', {
+          'guvenli_baglanti': 1,
           'cari_id': cariId,
           'fatura_no': faturaNo,
           'tarih': simdi,
@@ -669,9 +677,6 @@ class DatabaseService {
   // 🚨 STOK İŞLEMLERİ 🚨
   Future<List<Map<String, dynamic>>> getDepolar({required int firmaId}) async {
     final db = await getDatabase(firmaId: firmaId);
-    await db.rawDelete(
-      '''DELETE FROM depolar WHERE id NOT IN (SELECT MIN(id) FROM depolar GROUP BY depo_adi)''',
-    );
     return await db.query('depolar', orderBy: 'varsayilan DESC, depo_adi ASC');
   }
 
@@ -796,6 +801,8 @@ class DatabaseService {
     String? aciklama,
   }) async {
     final db = await getDatabase(firmaId: firmaId);
+    final yevmiyeIds = <int>[];
+    final stokIds = <int>[];
     double toplamMatrah = 0;
     double toplamKdv = 0;
     double toplamStmmMaliyeti = 0;
@@ -813,7 +820,7 @@ class DatabaseService {
           whereArgs: [stokId],
         );
         if (stokList.isEmpty) {
-          continue;
+          throw StateError('Faturadaki stok kartı bulunamadı: $stokId');
         }
         final stok = stokList.first;
         final String stokAdi = stok['stok_adi']?.toString() ?? 'Malzeme';
@@ -827,7 +834,7 @@ class DatabaseService {
         toplamKdv += satirKdv;
 
         final hareketTipi = faturaTipi == 'ALIS' ? 'GIRIS' : 'CIKIS';
-        await txn.insert('stok_hareketleri', {
+        stokIds.add(await txn.insert('stok_hareketleri', {
           'stok_id': stokId,
           'depo_id': 1,
           'hareket_tipi': hareketTipi,
@@ -839,10 +846,10 @@ class DatabaseService {
           'aciklama':
               aciklama ??
               '$faturaTipi Faturası: $fisNo - $cariUnvan ($stokAdi)',
-        });
+        }));
 
         if (faturaTipi == 'ALIS') {
-          await txn.insert('yevmiye_kayitlari', {
+          yevmiyeIds.add(await txn.insert('yevmiye_kayitlari', {
             'fis_no': fisNo,
             'tarih': tarih,
             'hesap_kodu': stokHesapKodu,
@@ -850,7 +857,7 @@ class DatabaseService {
             'borc': (satirMatrah * 100).round(),
             'alacak': 0,
             'aciklama': '$stokAdi Alımı ($miktar Adet)',
-          });
+          }));
         } else {
           toplamStmmMaliyeti += (miktar * alisMaliyeti);
         }
@@ -860,7 +867,7 @@ class DatabaseService {
 
       if (faturaTipi == 'ALIS') {
         if (toplamKdv > 0) {
-          await txn.insert('yevmiye_kayitlari', {
+          yevmiyeIds.add(await txn.insert('yevmiye_kayitlari', {
             'fis_no': fisNo,
             'tarih': tarih,
             'hesap_kodu': '191',
@@ -868,9 +875,9 @@ class DatabaseService {
             'borc': (toplamKdv * 100).round(),
             'alacak': 0,
             'aciklama': '$fisNo KDV Tutarı',
-          });
+          }));
         }
-        await txn.insert('yevmiye_kayitlari', {
+        yevmiyeIds.add(await txn.insert('yevmiye_kayitlari', {
           'fis_no': fisNo,
           'tarih': tarih,
           'hesap_kodu': '320',
@@ -878,9 +885,9 @@ class DatabaseService {
           'borc': 0,
           'alacak': (genelToplam * 100).round(),
           'aciklama': '$fisNo Alış Faturası',
-        });
+        }));
       } else {
-        await txn.insert('yevmiye_kayitlari', {
+        yevmiyeIds.add(await txn.insert('yevmiye_kayitlari', {
           'fis_no': fisNo,
           'tarih': tarih,
           'hesap_kodu': '120',
@@ -888,8 +895,8 @@ class DatabaseService {
           'borc': (genelToplam * 100).round(),
           'alacak': 0,
           'aciklama': '$fisNo Satış Faturası',
-        });
-        await txn.insert('yevmiye_kayitlari', {
+        }));
+        yevmiyeIds.add(await txn.insert('yevmiye_kayitlari', {
           'fis_no': fisNo,
           'tarih': tarih,
           'hesap_kodu': '600',
@@ -897,9 +904,9 @@ class DatabaseService {
           'borc': 0,
           'alacak': (toplamMatrah * 100).round(),
           'aciklama': '$fisNo Toplam Satış Hasılatı',
-        });
+        }));
         if (toplamKdv > 0) {
-          await txn.insert('yevmiye_kayitlari', {
+          yevmiyeIds.add(await txn.insert('yevmiye_kayitlari', {
             'fis_no': fisNo,
             'tarih': tarih,
             'hesap_kodu': '391',
@@ -907,11 +914,11 @@ class DatabaseService {
             'borc': 0,
             'alacak': (toplamKdv * 100).round(),
             'aciklama': '$fisNo Satış KDV Tutarı',
-          });
+          }));
         }
         if (toplamStmmMaliyeti > 0) {
           final maliyetFisNo = '$fisNo-STMM';
-          await txn.insert('yevmiye_kayitlari', {
+          yevmiyeIds.add(await txn.insert('yevmiye_kayitlari', {
             'fis_no': maliyetFisNo,
             'tarih': tarih,
             'hesap_kodu': '621',
@@ -919,8 +926,8 @@ class DatabaseService {
             'borc': (toplamStmmMaliyeti * 100).round(),
             'alacak': 0,
             'aciklama': '$fisNo Fatura Satış Maliyeti',
-          });
-          await txn.insert('yevmiye_kayitlari', {
+          }));
+          yevmiyeIds.add(await txn.insert('yevmiye_kayitlari', {
             'fis_no': maliyetFisNo,
             'tarih': tarih,
             'hesap_kodu': '153',
@@ -928,7 +935,7 @@ class DatabaseService {
             'borc': 0,
             'alacak': (toplamStmmMaliyeti * 100).round(),
             'aciklama': '$fisNo Envanter Çıkışı',
-          });
+          }));
         }
       }
 
@@ -939,7 +946,8 @@ class DatabaseService {
           ? (genelToplam * 100).round()
           : -(genelToplam * 100).round();
 
-      await txn.insert('cari_hareketler', {
+      final hareketId = await txn.insert('cari_hareketler', {
+        'guvenli_baglanti': 1,
         'cari_id': cariId,
         'fatura_no': fisNo,
         'tarih': tarih,
@@ -950,6 +958,14 @@ class DatabaseService {
         'alacak': faturaTipi == 'ALIS' ? (genelToplam * 100).round() : 0,
         'aciklama': '$tipMetni ($fisNo) - ${kalemler.length} Kalem',
       });
+      for (final id in yevmiyeIds) {
+        await txn.update('yevmiye_kayitlari', {'hareket_id': hareketId},
+            where: 'id = ?', whereArgs: [id]);
+      }
+      for (final id in stokIds) {
+        await txn.update('stok_hareketleri', {'hareket_id': hareketId},
+            where: 'id = ?', whereArgs: [id]);
+      }
       await txn.rawUpdate(
         'UPDATE cariler SET bakiye = bakiye + ? WHERE id = ?',
         [bakiyeFarki, cariId],
@@ -976,9 +992,15 @@ class DatabaseService {
       if (evraklar.isEmpty) {
         return;
       }
+      if (evraklar.first['durum'] != null && evraklar.first['durum'] != 'PORTFOYDE') {
+        throw StateError('Bu evrak daha önce kapatılmış veya işleme alınmış.');
+      }
+
       final evrak = evraklar.first;
+      if (!evraklar.first['evrak_turu'].toString().startsWith('MUSTERI')) throw StateError('Yalnızca alınan evrak için kullanılabilir.');
       final brutTutarKurus = (evrak['tutar'] as int?) ?? 0;
       final komisyonKurus = (komisyonTutari * 100).round();
+      if (komisyonKurus < 0 || komisyonKurus >= brutTutarKurus) throw StateError('Komisyon tutarı geçersiz.');
       final netTutarKurus = brutTutarKurus - komisyonKurus;
       await txn.update(
         'cek_senet_bordro',
@@ -1008,7 +1030,7 @@ class DatabaseService {
       ];
       for (var m in yevmiye) {
         await txn.insert('yevmiye_kayitlari', {
-          'hareket_id': cekId,
+          'hareket_id': evraklar.first['hareket_id'],
           'fis_no': fisNo,
           'tarih': simdi.substring(0, 10),
           'hesap_kodu': m['kod'],
@@ -1050,6 +1072,13 @@ class DatabaseService {
       if (evraklar.isEmpty) {
         return;
       }
+      if (evraklar.first['durum'] != null && evraklar.first['durum'] != 'PORTFOYDE') {
+        throw StateError('Bu evrak daha önce kapatılmış veya işleme alınmış.');
+      }
+
+      if (!evraklar.first['evrak_turu'].toString().startsWith('MUSTERI')) throw StateError('Yalnızca alınan evrak için kullanılabilir.');
+      final hedef = await txn.query('cariler', where: 'id = ?', whereArgs: [hedefCariId]);
+      if (hedef.length != 1) throw StateError('Hedef cari bulunamadı.');
       final brutTutar = (evraklar.first['tutar'] as int?) ?? 0;
       await txn.update(
         'cek_senet_bordro',
@@ -1072,7 +1101,7 @@ class DatabaseService {
       ];
       for (var m in yevmiye) {
         await txn.insert('yevmiye_kayitlari', {
-          'hareket_id': cekId,
+          'hareket_id': evraklar.first['hareket_id'],
           'fis_no': fisNo,
           'tarih': bugun,
           'hesap_kodu': m['kod'],
@@ -1114,6 +1143,14 @@ class DatabaseService {
       if (evraklar.isEmpty) {
         return;
       }
+      if (evraklar.first['durum'] != null && evraklar.first['durum'] != 'PORTFOYDE') {
+        throw StateError('Bu evrak daha önce kapatılmış veya işleme alınmış.');
+      }
+
+      final allocation = await txn.query('ai_odeme_eslestirme', where: 'odeme_id = ?', whereArgs: [evraklar.first['hareket_id']]);
+      await txn.delete('ai_odeme_eslestirme', where: 'odeme_id = ?', whereArgs: [evraklar.first['hareket_id']]);
+      final received = evraklar.first['evrak_turu'].toString().startsWith('MUSTERI');
+      if (received != true) throw StateError('Evrak yönü uyuşmuyor.');
       final brutTutar = (evraklar.first['tutar'] as int?) ?? 0;
       await txn.update(
         'cek_senet_bordro',
@@ -1122,7 +1159,8 @@ class DatabaseService {
         whereArgs: [cekId],
       );
       if (evraklar.first['cari_id'] != null) {
-        await txn.insert('cari_hareketler', {
+        final returnId = await txn.insert('cari_hareketler', {
+          'odeme_yontemi': allocation.isEmpty ? 'AÇIK_HESAP' : 'EVRAK_IADE',
           'cari_id': evraklar.first['cari_id'],
           'tarih': bugun,
           'islem_turu': 'KARSILIKSIZ',
@@ -1130,6 +1168,15 @@ class DatabaseService {
           'alacak': 0,
           'aciklama': 'Karşılıksız',
         });
+        final fis = await _yeniFisNoGetir(txn);
+        for (final row in [
+          {'kod': '120', 'borc': brutTutar, 'alacak': 0},
+          {'kod': (evraklar.first['evrak_turu'].toString().contains('SENET') ? '121' : '101'), 'borc': 0, 'alacak': brutTutar},
+        ]) {
+          await txn.insert('yevmiye_kayitlari', {'hareket_id': returnId, 'fis_no': fis,
+            'tarih': bugun, 'hesap_kodu': row['kod'], 'hesap_adi': 'Evrak İadesi',
+            'borc': row['borc'], 'alacak': row['alacak'], 'aciklama': 'Evrak kapanışının iadesi'});
+        }
         await txn.rawUpdate(
           'UPDATE cariler SET bakiye = bakiye + ? WHERE id = ?',
           [brutTutar, evraklar.first['cari_id']],
@@ -1153,6 +1200,14 @@ class DatabaseService {
       if (evraklar.isEmpty) {
         return;
       }
+      if (evraklar.first['durum'] != null && evraklar.first['durum'] != 'PORTFOYDE') {
+        throw StateError('Bu evrak daha önce kapatılmış veya işleme alınmış.');
+      }
+
+      final allocation = await txn.query('ai_odeme_eslestirme', where: 'odeme_id = ?', whereArgs: [evraklar.first['hareket_id']]);
+      await txn.delete('ai_odeme_eslestirme', where: 'odeme_id = ?', whereArgs: [evraklar.first['hareket_id']]);
+      final received = evraklar.first['evrak_turu'].toString().startsWith('MUSTERI');
+      if (received != false) throw StateError('Evrak yönü uyuşmuyor.');
       final brutTutar = (evraklar.first['tutar'] as int?) ?? 0;
       await txn.update(
         'cek_senet_bordro',
@@ -1161,7 +1216,8 @@ class DatabaseService {
         whereArgs: [cekId],
       );
       if (evraklar.first['cari_id'] != null) {
-        await txn.insert('cari_hareketler', {
+        final returnId = await txn.insert('cari_hareketler', {
+          'odeme_yontemi': allocation.isEmpty ? 'AÇIK_HESAP' : 'EVRAK_IADE',
           'cari_id': evraklar.first['cari_id'],
           'tarih': bugun,
           'islem_turu': 'KARSILIKSIZ_YAZILDI',
@@ -1169,6 +1225,15 @@ class DatabaseService {
           'alacak': brutTutar,
           'aciklama': 'Ödenemedi',
         });
+        final fis = await _yeniFisNoGetir(txn);
+        for (final row in [
+          {'kod': (evraklar.first['evrak_turu'].toString().contains('SENET') ? '321' : '103'), 'borc': brutTutar, 'alacak': 0},
+          {'kod': '320', 'borc': 0, 'alacak': brutTutar},
+        ]) {
+          await txn.insert('yevmiye_kayitlari', {'hareket_id': returnId, 'fis_no': fis,
+            'tarih': bugun, 'hesap_kodu': row['kod'], 'hesap_adi': 'Evrak İadesi',
+            'borc': row['borc'], 'alacak': row['alacak'], 'aciklama': 'Evrak kapanışının iadesi'});
+        }
         await txn.rawUpdate(
           'UPDATE cariler SET bakiye = bakiye - ? WHERE id = ?',
           [brutTutar, evraklar.first['cari_id']],
@@ -1183,10 +1248,25 @@ class DatabaseService {
     try {
       final db = await getDatabase(firmaId: firmaId);
       final rowsCari = await db.rawQuery(
-        '''SELECT h.id, h.id AS cari_hareket_id, NULL AS cek_id, h.tarih, CASE WHEN h.vade_tarihi IS NOT NULL AND TRIM(h.vade_tarihi) != '' THEN h.vade_tarihi ELSE h.tarih END AS vade_tarihi, h.fatura_no, h.odeme_yontemi, h.islem_turu, COALESCE(h.borc, 0) AS borc, COALESCE(h.alacak, 0) AS alacak, h.aciklama, h.belge_yolu, COALESCE(c.unvan, 'Genel İşlem') AS cari_unvan, 0 AS is_cek FROM cari_hareketler h LEFT JOIN cariler c ON c.id = h.cari_id WHERE h.odeme_yontemi NOT IN ('CEK', 'SENET')''',
+        """SELECT h.id, h.id AS cari_hareket_id, NULL AS cek_id, h.tarih,
+        CASE WHEN TRIM(COALESCE(h.vade_tarihi,'')) != '' THEN h.vade_tarihi ELSE h.tarih END AS vade_tarihi,
+        h.fatura_no, h.odeme_yontemi, h.islem_turu,
+        CASE WHEN h.borc > h.alacak THEN MAX(0,h.borc-h.alacak-COALESCE(a.tutar,0)) ELSE 0 END AS borc,
+        CASE WHEN h.alacak > h.borc THEN MAX(0,h.alacak-h.borc-COALESCE(a.tutar,0)) ELSE 0 END AS alacak,
+        h.aciklama,h.belge_yolu,COALESCE(c.unvan,'Genel İşlem') AS cari_unvan,0 AS is_cek
+        FROM cari_hareketler h LEFT JOIN cariler c ON c.id=h.cari_id
+        LEFT JOIN (SELECT fatura_id,SUM(tutar) AS tutar FROM ai_odeme_eslestirme GROUP BY fatura_id) a ON a.fatura_id=h.id
+        WHERE h.odeme_yontemi='AÇIK_HESAP' AND ABS(h.borc-h.alacak)>COALESCE(a.tutar,0)""",
       );
       final rowsCekSenet = await db.rawQuery(
-        '''SELECT id, id AS cek_id, NULL AS cari_hareket_id, vade_tarihi AS tarih, vade_tarihi, evrak_no AS fatura_no, evrak_turu AS odeme_yontemi, 'ÇEK/SENET' AS islem_turu, CASE WHEN evrak_turu LIKE '%MUSTERI%' THEN COALESCE(tutar, 0) ELSE 0 END AS borc, CASE WHEN evrak_turu LIKE '%BORC%' THEN COALESCE(tutar, 0) ELSE 0 END AS alacak, (kesideci || ' - ' || banka_adi) AS aciklama, belge_yolu, kesideci AS cari_unvan, banka_adi, durum, 1 AS is_cek FROM cek_senet_bordro WHERE durum = 'PORTFOYDE' OR durum IS NULL''',
+        """SELECT b.id,b.id AS cek_id,NULL AS cari_hareket_id,b.vade_tarihi AS tarih,b.vade_tarihi,
+        b.evrak_no AS fatura_no,b.evrak_turu AS odeme_yontemi,'ÇEK/SENET' AS islem_turu,
+        CASE WHEN b.evrak_turu LIKE '%MUSTERI%' THEN COALESCE(b.tutar,0) ELSE 0 END AS borc,
+        CASE WHEN b.evrak_turu LIKE '%BORC%' THEN COALESCE(b.tutar,0) ELSE 0 END AS alacak,
+        (b.kesideci || ' - ' || b.banka_adi) AS aciklama,b.belge_yolu,
+        COALESCE(c.unvan,b.kesideci) AS cari_unvan,b.banka_adi,b.durum,1 AS is_cek
+        FROM cek_senet_bordro b LEFT JOIN cariler c ON c.id=b.cari_id
+        WHERE b.durum='PORTFOYDE' OR b.durum IS NULL""",
       );
 
       final birlesmisListe = <Map<String, dynamic>>[
@@ -1479,41 +1559,32 @@ class DatabaseService {
 
   Future<bool> islemSil(int hareketId, {int firmaId = 1}) async {
     final db = await getDatabase(firmaId: firmaId);
-    final list = await db.query(
-      'cari_hareketler',
-      where: 'id = ?',
-      whereArgs: [hareketId],
-    );
-    if (list.isEmpty) {
-      return false;
-    }
-    final hareket = list.first;
-    final cariId = hareket['cari_id'] as int;
-    final borc = (hareket['borc'] as num?)?.toDouble() ?? 0.0;
-    final alacak = (hareket['alacak'] as num?)?.toDouble() ?? 0.0;
-    final netFark = borc - alacak;
-
-    final cariList = await db.query(
-      'cariler',
-      where: 'id = ?',
-      whereArgs: [cariId],
-    );
-    if (cariList.isNotEmpty) {
-      final mevcutBakiye =
-          (cariList.first['bakiye'] as num?)?.toDouble() ?? 0.0;
-      await db.update(
-        'cariler',
-        {'bakiye': mevcutBakiye - netFark},
-        where: 'id = ?',
-        whereArgs: [cariId],
+    return db.transaction((txn) async {
+      final rows = await txn.query('cari_hareketler',
+          where: 'id = ?', whereArgs: [hareketId]);
+      if (rows.isEmpty) return false;
+      final hareket = rows.first;
+      if (hareket['guvenli_baglanti'] != 1) {
+        throw StateError('Eski veya çek/senet kaydı otomatik silinemez; bağlantıları kontrol edilmelidir.');
+      }
+      final evraklar = await txn.query('cek_senet_bordro',
+          where: 'hareket_id = ?', whereArgs: [hareketId], limit: 1);
+      if (evraklar.isNotEmpty) {
+        throw StateError('Çek/senet bağlantılı kayıt silinemez.');
+      }
+      final borc = (hareket['borc'] as num?)?.toInt() ?? 0;
+      final alacak = (hareket['alacak'] as num?)?.toInt() ?? 0;
+      await txn.rawUpdate(
+        'UPDATE cariler SET bakiye = bakiye - ? WHERE id = ?',
+        [borc - alacak, hareket['cari_id']],
       );
-    }
-    await db.delete(
-      'yevmiye_kayitlari',
-      where: 'hareket_id = ?',
-      whereArgs: [hareketId],
-    );
-    await db.delete('cari_hareketler', where: 'id = ?', whereArgs: [hareketId]);
-    return true;
+      await txn.delete('stok_hareketleri',
+          where: 'hareket_id = ?', whereArgs: [hareketId]);
+      await txn.delete('yevmiye_kayitlari',
+          where: 'hareket_id = ?', whereArgs: [hareketId]);
+      await txn.delete('cari_hareketler',
+          where: 'id = ?', whereArgs: [hareketId]);
+      return true;
+    });
   }
 }

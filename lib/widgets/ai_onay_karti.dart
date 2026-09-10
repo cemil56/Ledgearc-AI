@@ -17,21 +17,34 @@ class AiOnayKarti extends ConsumerStatefulWidget {
 }
 
 class _AiOnayKartiState extends ConsumerState<AiOnayKarti> {
+  static const _evrakYonleri = {
+    'MUSTERI_CEKI': 'Alınan müşteri çeki',
+    'BORC_CEKI': 'Verilen kendi çekimiz',
+    'MUSTERI_SENEDI': 'Alınan senet',
+    'BORC_SENEDI': 'Verilen senet',
+  };
   Map<String, dynamic> get d => widget.item;
   final controllers = <String, TextEditingController>{};
   List<Map<String, dynamic>> cariler = [], stocks = [], depots = [], invoices = [];
   bool loading = true, busy = false;
   String? error;
+  int _loadGeneration = 0;
   final money = NumberFormat.currency(locale: 'tr_TR', symbol: '₺');
   @override
   void initState() {
     super.initState();
     d['islem_tarihi'] ??= DateTime.now().toIso8601String().substring(0, 10);
     if (AiIslemPlani.text(d, 'evrak_no').isEmpty) d['evrak_no'] = d['fatura_no'];
+    aiKayitRevision.addListener(_cataloguesChanged);
     _load();
   }
 
+  void _cataloguesChanged() {
+    if (mounted && d['is_saved'] != true) _load();
+  }
+
   Future<void> _load() async {
+    final generation = ++_loadGeneration;
     try {
       final db = await DatabaseService.instance.getDatabase(firmaId: d['firma_id'] as int);
       final values = await Future.wait([
@@ -40,16 +53,17 @@ class _AiOnayKartiState extends ConsumerState<AiOnayKarti> {
         db.query('depolar', orderBy: 'depo_adi'),
         db.query('cari_hareketler', where: 'odeme_yontemi = ? AND borc != alacak', whereArgs: ['AÇIK_HESAP']),
       ]);
-      if (mounted) setState(() { cariler = values[0]; stocks = values[1]; depots = values[2]; invoices = values[3]; });
+      if (mounted && generation == _loadGeneration) setState(() { cariler = values[0]; stocks = values[1]; depots = values[2]; invoices = values[3]; });
     } catch (_) {
-      if (mounted) setState(() => error = 'Cari/stok listeleri yüklenemedi. Kartı yeniden açın.');
+      if (mounted && generation == _loadGeneration) setState(() => error = 'Cari/stok listeleri yüklenemedi. Kartı yeniden açın.');
     } finally {
-      if (mounted) setState(() => loading = false);
+      if (mounted && generation == _loadGeneration) setState(() => loading = false);
     }
   }
 
   @override
   void dispose() {
+    aiKayitRevision.removeListener(_cataloguesChanged);
     for (final c in controllers.values) { c.dispose(); }
     super.dispose();
   }
@@ -119,6 +133,14 @@ class _AiOnayKartiState extends ConsumerState<AiOnayKarti> {
           crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
             Text('Firma: ${firma.aktifFirmaUnvan}'),
             Text('Karşı taraf: ${AiIslemPlani.text(snapshot, 'cari_unvan')}'),
+            if (plan['category'] == 'CEK_SENET') ...[
+              Text('Evrak numarası: ${plan['number']}'),
+              Text('Evrak yönü: ${_evrakYonleri[snapshot['evrak_turu']]}',
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+              Text('Keşideci: ${AiIslemPlani.text(snapshot, 'kesideci')}'),
+              if (AiIslemPlani.text(snapshot, 'evrak_turu').contains('CEK'))
+                Text('Banka: ${AiIslemPlani.text(snapshot, 'banka_adi')}'),
+            ],
             if (plan['amount'] != null) Text('Tutar: ${money.format((plan['amount'] as int) / 100)}'),
             Text('Kayıt tarihi: ${plan['date']}'),
             if ((plan['due'] as String).isNotEmpty) Text('Vade: ${plan['due']}'),
@@ -179,7 +201,12 @@ class _AiOnayKartiState extends ConsumerState<AiOnayKarti> {
         if (cheque || invoice) field('evrak_no', 'Belge / evrak numarası'),
         if (cheque) ...[
           field('kesideci', 'Keşideci (çeki/senedi düzenleyen)'), field('banka_adi', 'Banka (çek için gerekli)'),
-          choice('evrak_turu', 'Evrak yönü', const {'MUSTERI_CEKI': 'Alınan müşteri çeki', 'BORC_CEKI': 'Verilen kendi çekimiz', 'MUSTERI_SENEDI': 'Alınan senet', 'BORC_SENEDI': 'Verilen senet'}),
+          choice('evrak_turu', 'Evrak yönü', _evrakYonleri),
+          if (d['evrak_turu'] == 'BORC_CEKI') const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text('Bu seçim, kendi firmanızın düzenleyip verdiği çek içindir. '
+              'Müşteriden alınan çeki başkasına devretmek ayrı bir ciro işlemidir.'),
+          ),
           field('vade_tarihi', 'Vade tarihi (YYYY-MM-DD)'),
         ],
         if (cat == 'TICARI_CARI') choice('yon', 'Fatura yönü', const {'ALIS': 'Alış', 'SATIS': 'Satış'}),

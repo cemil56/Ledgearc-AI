@@ -14,6 +14,55 @@ class AiKayitService {
     request_id TEXT PRIMARY KEY, kategori TEXT NOT NULL, hareket_id INTEGER,
     sonuc TEXT NOT NULL, tarih TEXT NOT NULL)''';
 
+  // Compare the physical document, independently of its received/issued
+  // direction, counterparty, amount, date or settlement status.
+  // Formatting differences are tolerated; issuer names are not fuzzy-matched.
+  static String _kimlikMetni(Object? value) {
+    var normalized = (value?.toString() ?? '').trim().toUpperCase();
+    const letters = {'İ': 'I', 'Ş': 'S', 'Ğ': 'G', 'Ü': 'U', 'Ö': 'O', 'Ç': 'C'};
+    for (final entry in letters.entries) {
+      normalized = normalized.replaceAll(entry.key, entry.value);
+    }
+    return normalized
+        .replaceAll('\u0307', '')
+        .replaceAll(RegExp(r"[\s\u00a0\u200b.,;:'’()/\\-]+"), '');
+  }
+
+  static String _evrakNumarasi(Object? value) =>
+      (value?.toString() ?? '').trim().toUpperCase().replaceAll(RegExp(r'\s+'), '');
+
+  static Future<void> _mukerrerEvrakKontrolu(
+    Transaction txn, Map<String, dynamic> d, String number,
+  ) async {
+    final type = AiIslemPlani.text(d, 'evrak_turu');
+    final cheque = type == 'MUSTERI_CEKI' || type == 'BORC_CEKI';
+    final family = cheque
+        ? const ['MUSTERI_CEKI', 'BORC_CEKI']
+        : const ['MUSTERI_SENEDI', 'BORC_SENEDI'];
+    final issuer = _kimlikMetni(d['kesideci']);
+    final bank = _kimlikMetni(d['banka_adi']);
+    final serial = _evrakNumarasi(number);
+    if (issuer.isEmpty || (cheque && bank.isEmpty)) {
+      throw const FormatException('Keşideci ve banka bilgilerini kontrol edin.');
+    }
+    final candidates = await txn.query('cek_senet_bordro',
+      columns: ['id', 'evrak_no', 'evrak_turu', 'banka_adi', 'kesideci'],
+      where: 'evrak_turu IN (?, ?)', whereArgs: family);
+    for (final existing in candidates) {
+      if (_evrakNumarasi(existing['evrak_no']) != serial ||
+          _kimlikMetni(existing['kesideci']) != issuer ||
+          (cheque && _kimlikMetni(existing['banka_adi']) != bank)) continue;
+      final direction = existing['evrak_turu'].toString().startsWith('MUSTERI')
+          ? 'alınan' : 'verilen';
+      throw FormatException(
+        '$number numaralı ${cheque ? 'çek' : 'senet'} aynı keşideci'
+        '${cheque ? ' ve banka' : ''} ile bu firmada zaten kayıtlı '
+        '(kayıt #${existing['id']}, $direction). '
+        'Yönünü değiştirerek tekrar kaydedemezsiniz. Mevcut evrak kaydını kontrol edin.',
+      );
+    }
+  }
+
   static Future<Map<String, dynamic>> kaydet(Map<String, dynamic> data, int activeFirma) async {
     final snapshot = Map<String, dynamic>.from(data);
     if (snapshot['firma_id'] != activeFirma || activeFirma <= 0) {
@@ -73,10 +122,7 @@ class AiKayitService {
         }
         final number = plan['number'] as String;
         if (cat == 'CEK_SENET') {
-          final exists = await txn.query('cek_senet_bordro',
-            where: 'evrak_no = ? AND evrak_turu = ? AND banka_adi = ? AND kesideci = ?',
-            whereArgs: [number, d['evrak_turu'], AiIslemPlani.text(d, 'banka_adi'), AiIslemPlani.text(d, 'kesideci')]);
-          if (exists.isNotEmpty) throw const FormatException('Bu çek/senet daha önce kaydedilmiş.');
+          await _mukerrerEvrakKontrolu(txn, d, number);
         } else if (number.isNotEmpty && const ['TICARI_CARI', 'ISLETME_GIDERI'].contains(cat)) {
           final exists = await txn.query('cari_hareketler', where: 'cari_id = ? AND fatura_no = ?', whereArgs: [cariId, number]);
           if (exists.isNotEmpty) throw const FormatException('Bu cari ve belge numarası için kayıt zaten var.');
